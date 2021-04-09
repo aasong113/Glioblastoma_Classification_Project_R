@@ -1,0 +1,662 @@
+---
+title: "multi_classification_MGMT_IDH"
+author: "Anthony Song"
+date: "12/16/2020"
+output: html_document
+---
+
+
+
+```{r message=FALSE}
+library(plyr)
+library(xgboost)
+library(e1071)
+library(tidyverse)
+library(lubridate)
+library(ggpubr)
+library(readxl)
+library(ggplot2)
+library(ggpubr)
+library(matrixStats)
+library(dplyr)
+library(xlsx)
+library(NOISeq)
+library(glmnet)
+library(ISLR)
+library(dplyr)
+library(caret)
+library(ROCR)
+library(class)
+library(MASS)
+library(randomForest)
+```
+
+
+### Read in Pheno and g exp data. 
+```{r message = FALSE}
+
+# read in patient clinical information for Multiclass  
+info_og <- read_csv('TCGA_GBM_HT_HG-U133A_patient_information_v1.csv')
+info <- info_og
+
+g_exp_og <- read_csv('TCGA_GBM_HT_HG-U133A_geneEXP_v2.csv')
+# rename column 1
+names(g_exp_1)[1] <- "gene"
+```
+
+### MULTICLASS PIPELINE: Clean the data into a usable data frame. 
+```{r, message = FALSE}
+
+### For subtype IDH Mutation Status  
+info <- info[!is.na(info$subtype_IDH.status),]
+### For subtype MGMT promoter status. 
+info <- info[!is.na(info$subtype_MGMT.promoter.status),]
+
+# Select data with only tumor GBM patients. 
+info <-info %>%
+  filter(shortLetterCode == "TP")
+
+# Get relevant columns
+columns <- c("barcode", "subtype_IDH.status", "subtype_MGMT.promoter.status")
+info <- info[columns]
+
+
+# Split into IDHwt MGMTm, IDHwt MGMu, IDHm MGMTm, and IDHm MGMTu classes
+# Multiclass column Legend: 
+# 1 = IDHwt MGMTm
+# 2 = IDHwt MGMu
+# 3 = IDHm MGMTm
+# 4 = IDHm MGMTu
+
+info <- mutate(info , multiclass = case_when(
+  subtype_IDH.status == "WT" & subtype_MGMT.promoter.status == "Methylated" ~ "IDHwt_MGMTm",
+  subtype_IDH.status == "WT" & subtype_MGMT.promoter.status == "Unmethylated" ~ "IDHwt_MGMTu",
+  subtype_IDH.status == "Mutant" & subtype_MGMT.promoter.status == "Methylated" ~ "IDHm_MGMTm", 
+  subtype_IDH.status == "Mutant" & subtype_MGMT.promoter.status == "Unmethylated" ~ "IDHm_MGMTu"
+))
+
+# Get frequency
+table(info$multiclass)
+
+# Use all genes. 
+
+
+require(MASS)
+require(dplyr)
+
+# get all sample names
+source.names <- c( "gene" ,info$barcode)
+length(source.names)
+
+g_exp_1 <- g_exp_og
+colnames(g_exp_1)[1] = "gene"
+
+# filter expression data for sample names, and get distinct rows.  
+g_exp_1 <- g_exp_1 %>%
+  dplyr::select(source.names) %>%
+  mutate(gene= factor(gene)) %>%
+  distinct(gene,  .keep_all = TRUE)
+ncol(g_exp_1)# 320
+nrow(g_exp_1) # 10862
+
+# Remove genes with a dash in the name. Because it is not compatible with the random forrest. 
+g_exp_1 <- g_exp_1[!grepl("-", g_exp_1$gene),]
+nrow(g_exp_1) # 10829
+
+head(g_exp_1)
+
+# Get gene expression data with only the genes of interest. 
+g_exp_temp <- g_exp_1
+
+# transpose data frame. 
+g_exp_temp <- as.data.frame(t(as.matrix(g_exp_temp)))
+# turn first row into column names. 
+colnames(g_exp_temp) <- as.character(unlist(g_exp_temp[1,]))
+g_exp_temp = g_exp_temp[-1, ]
+# Convert all columns into numeric values. 
+g_exp_temp[] <- lapply(g_exp_temp, function(x) as.numeric(as.character(x)))
+
+# Merge into a final dataframe. 
+df <- cbind(info$multiclass, g_exp_temp)
+
+# Multiclass column Legend: 
+# 1 = IDHwt MGMTm
+# 2 = IDHwt MGMu
+# 3 = IDHm MGMTm
+# 4 = IDHm MGMTu
+names(df)[names(df) == "info$multiclass"] <- "multiclass"
+df$multiclass <- as.factor(df$multiclass)
+head(df)
+dat <- df
+```
+
+# Write to .csv to current directory
+```{r}
+write.csv(dat,"multiclass_data.csv")
+```
+
+
+# create small data set for testing
+```{r}
+test_dat <- dat[1:100,1:100]
+test_dat
+```
+### random forest multiclass cross validation. 
+## Returns a distribution of genes for each iteration. 
+```{r}
+
+# This is the outer loop. We are interested in running it 1000 times to get a distribution of genes. 
+n = 100
+
+for(i in 1:n){
+
+# Need to start with a fresh data set everytime since we are decreasing in our inner loop. 
+df <- test_dat
+
+cv_data <- data.frame(matrix(0, ncol = 3, nrow = 12))
+names(cv_data)[1] <- "iteration"
+names(cv_data)[2] <- "num_genes"
+names(cv_data)[3] <- "prediction_accuracy"
+
+optimal_gene_set <- c()
+
+# cross validation loop. 
+for(x in 1:10){
+
+# name iteration number.   
+cv_data[x, "iteration"] <- x
+
+# partition training and test data. 
+nindex <- createDataPartition(y = df$multiclass, p = 0.65, list = FALSE)
+
+#set.seed(314)    # Set seed for reproducible results
+#tindex <- sample(n, ntrain)   # Create a random index
+train_df <- df[nindex,]   # Create training set
+test_df <- df[-nindex,]   # Create test set
+
+
+# create random forest object. 
+modfit.rpart <- randomForest(multiclass ~ ., data=train_df, method="class", importance = TRUE)
+
+# Predict the testing set with the trained model 
+predictions1 <- predict(modfit.rpart, test_df, type = "class")
+
+# Accuracy and other metrics
+cm <- confusionMatrix(predictions1, test_df$multiclass)
+cv_data[x, "prediction_accuracy"] <- cm$overall['Accuracy']
+
+# Get genes by importance. 
+ordered_genes <- data.frame(modfit.rpart$importance)
+
+# order the genes by Mean Decrease in Accuracy. 
+ordered_genes <- arrange(ordered_genes, desc(MeanDecreaseAccuracy))
+ordered_genes
+
+# check to see if the current prediction accuracy is better than the previous. 
+#first iteration just set the first gene set to the optimal. 
+if(x == 1){
+  optimal_gene_set <- rownames(ordered_genes)
+}
+# else if current prediction accuracy is greater than or equal to the max accuracy then replace it. 
+else if(cm$overall['Accuracy'] >= max(cv_data$prediction_accuracy, na.rm = TRUE)){
+  optimal_gene_set <- rownames(ordered_genes)
+}
+
+# write number of ordered genes. 
+cv_data[x, "num_genes"] <- nrow(ordered_genes)
+
+# Take the top 50% of genes with the highest mean decrease in accuracy. 
+half_genes <- ordered_genes[1:ceiling(0.5 * nrow(ordered_genes)),]
+
+# replace data frame with top 50% genes.  
+df <- df[ prepend(rownames(half_genes), "multiclass")] 
+
+# reiterate. 
+}
+
+# In the first iteration we create the table. 
+if(i == 1){
+table <- as.data.frame(table(optimal_gene_set))
+}
+# else we add to the table. 
+else{
+  
+# This loop goes through the frequency data frame and adds the current vector of genes to the dataframe. 
+for (gene in optimal_gene_set){
+  
+  # if the gene is in the current table
+  if( any(gene %in% table$optimal_gene_set)){
+    
+    #get the index of the gene in the data frame. 
+    index <- which(grepl(gene, table$optimal_gene_set))
+    # increase the frequency by 1. 
+    table[index,2] <- table[index,2]+1
+    
+  }
+  
+  # if gene is not in the current gene set add it to the gene set with frequency of 1
+  else{
+    
+    # create a data frame with the new gene to add. 
+    temp<-data.frame(gene,1)
+    names(temp)<-c(colnames(table)[1], colnames(table)[2])
+
+    # bind the two data frames. 
+    table <- rbind(table, temp)
+    
+    
+  }
+}
+  
+}
+
+}
+
+table
+cv_data
+
+```
+```{r}
+colnames(table)
+
+```
+
+# This is the architecture of the loop to create the dictionary data frame. 
+```{r}
+table <- as.data.frame(table(multiclass_genes))
+
+test <- c("CBR1", "MGMT", "FBXO17", "DDB2", "YOLO69", "Paster")
+
+
+# This loop goes through the frequency data frame and adds the current vector of genes to the dataframe. 
+for (gene in test){
+  
+  # if the gene is in the current table
+  if( any(gene %in% table$multiclass_genes)){
+    
+    #get the index of the gene in the data frame. 
+    index <- which(grepl(gene, table$multiclass_genes))
+    # increase the frequency by 1. 
+    table[index,2] <- table[index,2]+1
+    
+  }
+  
+  # if gene is not in the current gene set add it to the gene set with frequency of 1
+  else{
+    
+    # create a data frame with the new gene to add. 
+    temp<-data.frame(gene,1)
+    names(temp)<-c("multiclass_genes","Freq")
+
+    # bind the two data frames. 
+    table <- rbind(table, temp)
+    
+    
+  }
+}
+table
+
+```
+
+# Information on Optimal performance for multiclass setting. 
+```{r}
+multiclass_genes <- rownames(ordered_genes)
+multiclass_genes
+cm
+```
+
+
+
+
+
+
+### DICHOTOMOUS MGMT PIPELINE: Clean the data into a usable data frame. 
+```{r, message = FALSE}
+# for dichotomous MGMT
+info1 <- info_og
+
+### For subtype MGMT promoter status. 
+info1 <- info1[!is.na(info1$subtype_MGMT.promoter.status),]
+
+# Select data with only tumor GBM patients. 
+info1 <-info1 %>%
+  filter(shortLetterCode == "TP")
+
+# Get relevant columns
+columns <- c("barcode", "subtype_IDH.status", "subtype_MGMT.promoter.status")
+info1 <- info1[columns]
+
+
+# Split into IDHwt MGMTm, IDHwt MGMu, IDHm MGMTm, and IDHm MGMTu classes
+# Multiclass column Legend: 
+# 1 = MGMTm
+# 2 = MGMu
+
+info1 <- mutate(info1 , multiclass = case_when(
+  subtype_MGMT.promoter.status == "Methylated" ~ "MGMTm",
+  subtype_MGMT.promoter.status == "Unmethylated" ~ "MGMTu"
+))
+
+# Get frequency
+table(info1$multiclass)
+```
+
+```{r}
+require(MASS)
+require(dplyr)
+
+# get all sample names
+source.names <- c( "gene" ,info1$barcode)
+length(source.names)
+
+g_exp_2 <- g_exp_og
+colnames(g_exp_2)[1] = "gene"
+
+# filter expression data for sample names, and get distinct rows.  
+g_exp_2 <- g_exp_2 %>%
+  dplyr::select(source.names) %>%
+  mutate(gene= factor(gene)) %>%
+  distinct(gene,  .keep_all = TRUE)
+ncol(g_exp_2)# 364
+nrow(g_exp_2) # 10862
+
+# Remove genes with a dash in the name. Because it is not compatible with the random forrest. 
+g_exp_2 <- g_exp_2[!grepl("-", g_exp_2$gene),]
+nrow(g_exp_2) # 10829
+
+head(g_exp_2)
+
+# Get gene expression data with only the genes of interest. 
+g_exp_temp <- g_exp_2
+
+# transpose data frame. 
+g_exp_temp <- as.data.frame(t(as.matrix(g_exp_temp)))
+# turn first row into column names. 
+colnames(g_exp_temp) <- as.character(unlist(g_exp_temp[1,]))
+g_exp_temp = g_exp_temp[-1, ]
+# Convert all columns into numeric values. 
+g_exp_temp[] <- lapply(g_exp_temp, function(x) as.numeric(as.character(x)))
+
+# Merge into a final dataframe. 
+df <- cbind(info1$multiclass, g_exp_temp)
+
+names(df)[names(df) == "info1$multiclass"] <- "multiclass"
+df$multiclass <- as.factor(df$multiclass)
+head(df)
+```
+# Write to .csv to current directory
+```{r}
+write.csv(df,"MGMT_data.csv")
+```
+
+### random forest MGMT dichotomous classification cross validation. 
+#MGMT dichotomous classification 
+```{r}
+# create data frame to fill in. Will run 12 iterations.
+cv_data1 <- data.frame(matrix(0, ncol = 3, nrow = 12))
+names(cv_data1)[1] <- "iteration"
+names(cv_data1)[2] <- "num_genes"
+names(cv_data1)[3] <- "prediction_accuracy"
+
+
+
+# MGMT dichotomous cross validation loop. 
+
+for(x in 1:9){
+
+# name iteration number.   
+cv_data1[x, "iteration"] <- x
+
+# partition training and test data. 
+nindex <- createDataPartition(y = df1$multiclass, p = 0.65, list = FALSE)
+
+#set.seed(314)    # Set seed for reproducible results
+#tindex <- sample(n, ntrain)   # Create a random index
+train_df1 <- df1[nindex,]   # Create training set
+test_df1 <- df1[-nindex,]   # Create test set
+
+
+# create random forest object. 
+modfit.rpart <- randomForest(multiclass ~ ., data=train_df1, method="class", importance = TRUE)
+
+# Predict the testing set with the trained model 
+predictions2 <- predict(modfit.rpart, test_df1, type = "class")
+
+# Accuracy and other metrics
+cm1 <- confusionMatrix(predictions2, test_df1$multiclass)
+cv_data1[x, "prediction_accuracy"] <- cm1$overall['Accuracy']
+
+# Get genes by importance. 
+ordered_genes_mgmt <- data.frame(modfit.rpart$importance)
+
+# order the genes by Mean Decrease in Accuracy. 
+ordered_genes_mgmt <- arrange(ordered_genes_mgmt, desc(MeanDecreaseAccuracy))
+ordered_genes_mgmt
+
+# write number of ordered genes. 
+cv_data1[x, "num_genes"] <- nrow(ordered_genes_mgmt)
+
+# Take the top 50% of genes with the highest mean decrease in accuracy. 
+half_genes_mgmt <- ordered_genes_mgmt[1:ceiling(0.5 * nrow(ordered_genes_mgmt)),]
+
+# replace data frame with top 50% genes.  
+df1 <- df1[ prepend(rownames(half_genes_mgmt), "multiclass")] 
+
+# reiterate. 
+}
+
+
+cv_data1
+
+```
+
+```{r}
+mgmt_optimal_MDA_genes <- rownames(ordered_genes_mgmt)
+mgmt_optimal_MDA_genes
+#varImpPlot(modfit.rpart)
+#cm1
+```
+
+
+### DICHOTOMOUS IDH PIPELINE: Clean the data into a usable data frame. 
+
+```{r, message = FALSE}
+# for dichotomous IDH
+info2 <- info_og
+
+### For subtype IDH promoter status. 
+info2 <- info2[!is.na(info2$subtype_IDH.status),]
+
+# Select data with only tumor GBM patients. 
+info2 <-info2 %>%
+  filter(shortLetterCode == "TP")
+
+# Get relevant columns
+columns <- c("barcode", "subtype_IDH.status", "subtype_MGMT.promoter.status")
+info2 <- info2[columns]
+
+
+# Split into IDHwt MGMTm, IDHwt MGMu, IDHm MGMTm, and IDHm MGMTu classes
+# Multiclass column Legend: 
+# 1 = IDHm
+# 2 = IDHwt
+
+info2 <- mutate(info2 , multiclass = case_when(
+
+  subtype_IDH.status == "WT"  ~ "IDHwt",
+  subtype_IDH.status == "Mutant"  ~ "IDHm"
+  
+))
+
+# Get frequency
+table(info2$multiclass)
+```
+
+```{r}
+head(info2)
+```
+
+```{r}
+require(MASS)
+require(dplyr)
+
+# get all sample names
+source.names <- c( "gene" ,info2$barcode)
+length(source.names)
+
+g_exp_3 <- g_exp_og
+colnames(g_exp_3)[1] = "gene"
+
+# filter expression data for sample names, and get distinct rows.  
+g_exp_3 <- g_exp_3 %>%
+  dplyr::select(source.names) %>%
+  mutate(gene= factor(gene)) %>%
+  distinct(gene,  .keep_all = TRUE)
+ncol(g_exp_3)# 434
+nrow(g_exp_3) # 10862
+
+# Remove genes with a dash in the name. Because it is not compatible with the random forrest. 
+g_exp_3 <- g_exp_3[!grepl("-", g_exp_3$gene),]
+nrow(g_exp_3) # 10829
+
+head(g_exp_3)
+
+# Get gene expression data with only the genes of interest. 
+g_exp_temp <- g_exp_3
+
+# transpose data frame. 
+g_exp_temp <- as.data.frame(t(as.matrix(g_exp_temp)))
+# turn first row into column names. 
+colnames(g_exp_temp) <- as.character(unlist(g_exp_temp[1,]))
+g_exp_temp = g_exp_temp[-1, ]
+# Convert all columns into numeric values. 
+g_exp_temp[] <- lapply(g_exp_temp, function(x) as.numeric(as.character(x)))
+
+# Merge into a final dataframe. 
+df <- cbind(info2$multiclass, g_exp_temp)
+
+names(df)[names(df) == "info2$multiclass"] <- "multiclass"
+df$multiclass <- as.factor(df$multiclass)
+head(df)
+```
+# Write to .csv to current directory
+```{r}
+write.csv(df,"IDH_data.csv")
+```
+
+
+### random forest IDH dichotomous classification cross validation. 
+
+#IDH dichotomous classification 
+```{r}
+# create data frame to fill in. Will run 12 iterations.
+cv_data2 <- data.frame(matrix(0, ncol = 3, nrow = 12))
+names(cv_data2)[1] <- "iteration"
+names(cv_data2)[2] <- "num_genes"
+names(cv_data2)[3] <- "prediction_accuracy"
+
+
+# MGMT dichotomous cross validation loop. 
+
+for(x in 1:9){
+
+# name iteration number.   
+cv_data2[x, "iteration"] <- x
+
+# partition training and test data. 
+nindex <- createDataPartition(y = df2$multiclass, p = 0.65, list = FALSE)
+
+#set.seed(314)    # Set seed for reproducible results
+#tindex <- sample(n, ntrain)   # Create a random index
+train_df2 <- df2[nindex,]   # Create training set
+test_df2 <- df2[-nindex,]   # Create test set
+
+
+# create random forest object. 
+modfit.rpart <- randomForest(multiclass ~ ., data=train_df2, method="class", importance = TRUE)
+
+# Predict the testing set with the trained model 
+predictions3 <- predict(modfit.rpart, test_df2, type = "class")
+
+# Accuracy and other metrics
+cm2 <- confusionMatrix(predictions3, test_df2$multiclass)
+cv_data2[x, "prediction_accuracy"] <- cm2$overall['Accuracy']
+
+# Get genes by importance. 
+ordered_genes_idh <- data.frame(modfit.rpart$importance)
+
+# order the genes by Mean Decrease in Accuracy. 
+ordered_genes_idh <- arrange(ordered_genes_idh, desc(MeanDecreaseAccuracy))
+ordered_genes_idh
+
+# write number of ordered genes. 
+cv_data2[x, "num_genes"] <- nrow(ordered_genes_idh)
+
+# Take the top 50% of genes with the highest mean decrease in accuracy. 
+half_genes_idh <- ordered_genes_idh[1:ceiling(0.5 * nrow(ordered_genes_idh)),]
+
+# replace data frame with top 50% genes.  
+df2 <- df2[ prepend(rownames(half_genes_idh), "multiclass")] 
+
+# reiterate. 
+}
+
+
+cv_data2
+
+```
+
+```{r}
+idh_optimal_MDA_genes <- rownames(ordered_genes_idh)
+ordered_genes_idh
+varImpPlot(modfit.rpart)
+cm2
+```
+
+```{r}
+idh_optimal_MDA_genes 
+mgmt_optimal_MDA_genes
+multiclass_genes
+```
+```{r}
+idh_mgmt_intersect <- intersect(idh_optimal_MDA_genes ,mgmt_optimal_MDA_genes )
+idh_mgmt_intersect
+
+idh_multiclass_intersect <- intersect(idh_optimal_MDA_genes ,multiclass_genes )
+idh_multiclass_intersect
+
+mgmt_multiclass_intersect <- intersect(mgmt_optimal_MDA_genes, multiclass_genes)
+mgmt_multiclass_intersect 
+
+idh_mgmt_union_1 <- union(idh_optimal_MDA_genes ,mgmt_optimal_MDA_genes )
+set_diff_multiclass_1 <-setdiff(multiclass_genes, idh_mgmt_union_1)
+set_diff_multiclass_1
+```
+
+# PPT Intersections: 
+```{r}
+multiclass_genes_1 <- c("MGMT", "DIS3", "FBXO17", "IFNA21", "DYNLT3", "CBR1", "BGH1", "EMP3", "DRG2", "RBP1", "TIMP1", "HTATIP2", "TRIP4", "TAGLN2", "DDB2", "PER1", "FCHSD2", "RARRES2", "MSN", "CRIPT", "CXCL9", "TMEM100")
+
+mgmt_genes <- c("MGMT", "TPSG1", "DDB2", "ANXA7", "CYP46A1", "PAXIP1", "HTATIP2", "HIRA", "FIG4", "RRAGD", "HEY1", "CCNC", "HSPBP1", "CCDC121", "SLC2A10", "OBSL1", "USP32", "GPI", "KPNA5", "NSUN5", "NOX1", "TRMT11", "CUEDC2", "ACTN4", "HCCS", "INPP5E", "HYOU1", "ABCG5", "RNF146", "SLC4A8", "S100A13", "ITGA4", "GIPC1", "TJAP1", "UXS1", "HIST1H31", "LRP3", "EXOSC4", "ADM", "ASNA1", "ABCG2", "ZBTB16", "ZAP70")
+
+
+idh_genes <- c("FBXO17", "CBR1", "TIMP1", "TAGLN2", "RBP1", "DDB2", "EMP3", "TRIP4", "C1QL1", "RAB36", "FHL2", "BMP2", "WWTR1", "EFEMP2", "ZNF248", "DRG2", "TMEM100", "PNPLA4", "PHLDA3", "MEOX2", "SLC25A20", "PLP2", "SLC43A3", "BDH1", "ATXN7L1", "AKAP6",  "ABI1", "ALDOA", "LRRC49", "SLC27A3", "ALCAM", "BMP5", "PRPS2", "DAZ4", "CD97", "GDF15", "CRTAC1", "PDGFA", "SEC61G", "FRY", "AMFR", "SEC31B", "ARHGAP12")
+
+idh_mgmt_intersection <- intersect(idh_genes ,mgmt_genes )
+idh_mgmt_intersection 
+
+
+multiclass_idh_intersect_1 <- intersect(multiclass_genes_1, idh_genes)
+multiclass_idh_intersect_1
+
+multiclass_mgmt_intersect_1 <- intersect(multiclass_genes_1, mgmt_genes)
+multiclass_mgmt_intersect_1
+
+idh_mgmt_union <- union(idh_genes ,mgmt_genes )
+set_diff_multiclass <-setdiff(multiclass_genes_1, idh_mgmt_union )
+set_diff_multiclass
+```
+
+
+
+

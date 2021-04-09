@@ -1,0 +1,307 @@
+---
+title: "Distribution_Analysis_1000"
+author: "Anthony Song"
+date: "3/26/2021"
+output: html_document
+---
+
+```{r message=FALSE}
+library(plyr)
+library(tidyverse)
+library(lubridate)
+library(readxl)
+library(ggplot2)
+library(matrixStats)
+library(dplyr)
+library(xlsx)
+library(glmnet)
+library(ISLR)
+library(dplyr)
+library(caret)
+library(ROCR)
+library(class)
+library(MASS)
+library(randomForest)
+#library(e1071)
+```
+
+### random forest multiclass cross validation. 
+### Use multiclass_data.csv
+## Returns a distribution of genes for each iteration. 
+## Data must be as factor in order of the Random forrest to run. 
+
+# 1.) 
+```{r}
+# Multiclass data
+multiclass_dat <- read_csv('multiclass_data.csv')
+multiclass_dat$multiclass = factor(multiclass_dat$multiclass) 
+dat1<- multiclass_dat
+dat1$X1 <- NULL
+head(dat1)
+```
+
+```{r}
+as.numeric(dat1)
+```
+## 2.)  MGMT methylated vs. MGMT unmethylated
+```{r}
+# MGMT methylated vs. MGMT unmethylated
+MGMT_dat <- read_csv('MGMT_data.csv')
+MGMT_dat$multiclass = factor(MGMT_dat$multiclass) 
+dat2<- MGMT_dat
+dat2$X1 <- NULL
+head(dat2)
+```
+## 3.) IDH wt vs. IDH Mutant
+```{r}
+
+# IDH wildtype vs. IDH mutant
+IDH_dat <- read_csv('IDH_data.csv')
+IDH_dat$multiclass = factor(IDH_dat$multiclass) 
+dat3<- IDH_dat
+dat3$X1 <- NULL
+head(dat3)
+
+```
+## 4.) MGMT only (IDHwt_MGMTm + IDHm_MGMTm = 139 samples) vs. Rest (IDHm_MGMTu+ IDHwt_MGMTu = 180 samples) 
+```{r}
+dat4 <- multiclass_dat
+dat4 <- mutate(dat4 , multiclass = case_when(
+
+  multiclass == "IDHwt_MGMTm"  ~ "MGMT_mutant",
+  multiclass == "IDHm_MGMTm"  ~ "MGMT_mutant", 
+  multiclass == "IDHm_MGMTu"  ~ "Rest",
+  multiclass == "IDHwt_MGMTu"  ~ "Rest"
+  
+))
+dat4$X1 <- NULL
+dat4$multiclass = factor(dat4$multiclass) 
+table(dat4$multiclass)
+head(dat4)
+```
+## 5.)	IDHwt_MGMTu (173 samples) vs. the rest (IDHm_MGMTm + IDHm_MGMTu + IDHwt_MGMTm = 146 samples ) 
+```{r}
+dat5 <- multiclass_dat
+dat5 <- mutate(dat5 , multiclass = case_when(
+
+  multiclass == "IDHwt_MGMTu"  ~ "IDHwt_MGMTu",
+  multiclass == "IDHm_MGMTm"  ~ "Rest", 
+  multiclass == "IDHm_MGMTu"  ~ "Rest",
+  multiclass == "IDHwt_MGMTm"  ~ "Rest"
+  
+))
+dat5$X1 <- NULL
+dat5$multiclass = factor(dat5$multiclass) 
+table(dat5$multiclass)
+head(dat5)
+```
+
+
+## 6.) IDH mutant by itself (IDHm_MGMTm + IDHm_MGMTu = 28 samples) vs Rest (IDHwt_MGMTm + IDHwt_MGMTu = 291 samples)
+```{r}
+dat6 <- multiclass_dat
+dat6 <- mutate(dat6 , multiclass = case_when(
+
+  multiclass == "IDHwt_MGMTu"  ~ "Rest",
+  multiclass == "IDHm_MGMTm"  ~ "IDHm", 
+  multiclass == "IDHm_MGMTu"  ~ "IDHm",
+  multiclass == "IDHwt_MGMTm"  ~ "Rest"
+  
+))
+dat6$X1 <- NULL
+dat6$multiclass = factor(dat6$multiclass) 
+head(dat6)
+table(dat6$multiclass)
+```
+
+## 7.)	Inside MGMTu, can we distinguish between IDHm and IDHwt. Sample size = 180. (IDHm_MGMTu = 7 vs. IDHwt_MGMTu = 173)
+
+```{r}
+dat7 <- multiclass_dat
+dat7 <- mutate(dat7 , multiclass = case_when(
+
+  multiclass == "IDHwt_MGMTu"  ~ "IDHwt_insideMGMTu",
+  multiclass == "IDHm_MGMTm"  ~ "rest", 
+  multiclass == "IDHm_MGMTu"  ~ "IDHm_insideMGMTu",
+  multiclass == "IDHwt_MGMTm"  ~ "rest"
+  
+))
+dat7$X1 <- NULL
+dat7<-dat7[!(dat7$multiclass=="rest"),]
+dat7$multiclass = factor(dat7$multiclass) 
+head(dat7)
+table(dat7$multiclass)
+```
+
+## 8.)	Inside MGMTm, can we distingushi between IDHm and IDHwt. Sample size = 139. (IDHm_MGMTm = 21 and IDHwt_MGMTm = 118)
+```{r}
+dat8 <- multiclass_dat
+dat8 <- mutate(dat8 , multiclass = case_when(
+
+  multiclass == "IDHwt_MGMTu"  ~ "rest",
+  multiclass == "IDHm_MGMTm"  ~ "IDHm_inside_MGMTm", 
+  multiclass == "IDHm_MGMTu"  ~ "rest",
+  multiclass == "IDHwt_MGMTm"  ~ "IDHwt_inside_MGMTm"
+  
+))
+dat8$X1 <- NULL
+dat8<-dat8[!(dat8$multiclass=="rest"),]
+dat8$multiclass = factor(dat8$multiclass) 
+head(dat8)
+table(dat8$multiclass)
+```
+
+
+Check below later. 
+## 9.) 	(IDHm_MGMTm + IDHwt_MGMTm = 139) vs. (IDHwt_MGMTm = 118) To see if the 21 IDH mutant samples  makes a difference at all. 
+
+dat7 <- multiclass_dat
+dat7 <- mutate(dat7 , multiclass = case_when(
+
+  multiclass == "IDHwt_MGMTu"  ~ "",
+  multiclass == "IDHm_MGMTm"  ~ "MGMTm_IDH", 
+  multiclass == "IDHm_MGMTu"  ~ "",
+  multiclass == "IDHwt_MGMTm"  ~ "MGMTm_IDH"
+  
+))
+
+
+dat7<-dat7[!(dat7$multiclass=="B"),]
+dat7$X1 <- NULL
+head(dat7)
+table(dat7$multiclass)
+
+
+
+
+
+```{r}
+table(multiclass_dat$multiclass)
+```
+
+```{r}
+
+dat_test_1 = dat1[1:100, 1:100]
+dat_test_1
+```
+#### This loop gets the distribution of the genes for 1000 CV loops. It is universal and can be used for all of them. 
+```{r}
+
+# This is the outer loop. We are interested in running it 1000 times to get a distribution of genes. 
+n = 1000
+
+for(i in 1:n){
+
+# Need to start with a fresh data set everytime since we are decreasing in our inner loop. 
+df <- dat1
+
+cv_data <- data.frame(matrix(0, ncol = 3, nrow = 12))
+names(cv_data)[1] <- "iteration"
+names(cv_data)[2] <- "num_genes"
+names(cv_data)[3] <- "prediction_accuracy"
+
+optimal_gene_set <- c()
+
+# cross validation loop. 
+for(x in 1:10){
+
+# name iteration number.   
+cv_data[x, "iteration"] <- x
+
+# partition training and test data. 
+nindex <- createDataPartition(y = df$multiclass, p = 0.65, list = FALSE)
+
+#set.seed(314)    # Set seed for reproducible results
+#tindex <- sample(n, ntrain)   # Create a random index
+train_df <- df[nindex,]   # Create training set
+test_df <- df[-nindex,]   # Create test set
+
+
+# create random forest object. 
+modfit.rpart <- randomForest(multiclass ~ ., data=train_df, method="class", importance = TRUE)
+
+# Predict the testing set with the trained model 
+predictions1 <- predict(modfit.rpart, test_df, type = "class")
+
+# Accuracy and other metrics
+cm <- confusionMatrix(predictions1, test_df$multiclass)
+cv_data[x, "prediction_accuracy"] <- cm$overall['Accuracy']
+
+# Get genes by importance. 
+ordered_genes <- data.frame(modfit.rpart$importance)
+
+# order the genes by Mean Decrease in Accuracy. 
+ordered_genes <- arrange(ordered_genes, desc(MeanDecreaseAccuracy))
+ordered_genes
+
+# check to see if the current prediction accuracy is better than the previous. 
+#first iteration just set the first gene set to the optimal. 
+if(x == 1){
+  optimal_gene_set <- rownames(ordered_genes)
+}
+# else if current prediction accuracy is greater than or equal to the max accuracy then replace it. 
+else if(cm$overall['Accuracy'] >= max(cv_data$prediction_accuracy, na.rm = TRUE)){
+  optimal_gene_set <- rownames(ordered_genes)
+}
+
+# write number of ordered genes. 
+cv_data[x, "num_genes"] <- nrow(ordered_genes)
+
+# Take the top 50% of genes with the highest mean decrease in accuracy. 
+half_genes <- ordered_genes[1:ceiling(0.5 * nrow(ordered_genes)),]
+
+# replace data frame with top 50% genes.  
+df <- df[ prepend(rownames(half_genes), "multiclass")] 
+
+# reiterate. 
+}
+
+# In the first iteration we create the table. 
+if(i == 1){
+table <- as.data.frame(table(optimal_gene_set))
+}
+# else we add to the table. 
+else{
+  
+# This loop goes through the frequency data frame and adds the current vector of genes to the dataframe. 
+for (gene in optimal_gene_set){
+  
+  # if the gene is in the current table
+  if( any(gene %in% table$optimal_gene_set)){
+    
+    #get the index of the gene in the data frame. 
+    index <- which(grepl(gene, table$optimal_gene_set))
+    # increase the frequency by 1. 
+    table[index,2] <- table[index,2]+1
+    
+  }
+  
+  # if gene is not in the current gene set add it to the gene set with frequency of 1
+  else{
+    
+    # create a data frame with the new gene to add. 
+    temp<-data.frame(gene,1)
+    names(temp)<-c(colnames(table)[1], colnames(table)[2])
+
+    # bind the two data frames. 
+    table <- rbind(table, temp)
+    
+    
+  }
+}
+  
+}
+
+}
+multiclass_table <- table
+write.csv(multiclass_table,"multiclass_gene_distribution.csv")
+```
+```{r}
+table
+```
+
+### Writes the table to .csv
+```{r}
+multiclass_table <- table
+write.csv(multiclass_table,"multiclass_gene_distribution.csv")
+```
